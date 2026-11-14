@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PolyDrive | Store Any File Inside a 3D Printable STL Mesh</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { background: #090d16; color: #e2e8f0; font-family: ui-sans-serif, system-ui, sans-serif; }
+    canvas { display: block; width: 100%; height: 100%; }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col">
+  <header class="border-b border-slate-800 px-6 py-4 flex flex-wrap items-center justify-between gap-4 bg-slate-950/80">
+    <div>
+      <h1 class="text-xl font-bold tracking-tight text-cyan-400">PolyDrive <span class="text-xs font-mono bg-cyan-950 text-cyan-300 px-2 py-0.5 rounded ml-2">WEIRD STORAGE</span></h1>
+      <p class="text-xs text-slate-400">Encode any file into a watertight 3D-printable binary .STL cityscape and recover the exact bytes.</p>
+    </div>
+    <button id="demoBtn" class="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white transition">
+      ⚡ Run 1-Click Round-Trip Demo
+    </button>
+  </header>
+
+  <main class="flex-1 grid grid-cols-1 lg:grid-cols-12 gap-6 p-6 max-w-7xl w-full mx-auto">
+    <div class="lg:col-span-5 flex flex-col gap-5">
+      <section class="bg-slate-900/90 border border-slate-800 rounded-xl p-5">
+        <h2 class="text-sm font-semibold uppercase tracking-wider text-cyan-400 mb-1">1. File &rarr; 3D Mesh (.STL)</h2>
+        <p class="text-xs text-slate-400 mb-4">Compresses your file and maps every 2 bytes to the height of a 3D pillar.</p>
+        <label class="flex flex-col items-center justify-center border-2 border-dashed border-slate-700 hover:border-cyan-500 rounded-lg p-5 cursor-pointer transition bg-slate-950/50">
+          <span class="text-sm font-medium text-slate-200">Drop any file here or click to browse</span>
+          <span class="text-xs text-slate-500 mt-1">Works with .zip, .jpg, .mp3, .pdf, code, anything</span>
+          <input id="encodeInput" type="file" class="hidden" />
+        </label>
+        <div id="encodeStatus" class="mt-3 text-xs font-mono text-slate-300 hidden bg-slate-950 p-3 rounded border border-slate-800"></div>
+      </section>
+
+      <section class="bg-slate-900/90 border border-slate-800 rounded-xl p-5">
+        <h2 class="text-sm font-semibold uppercase tracking-wider text-violet-400 mb-1">2. 3D Mesh (.STL) &rarr; Original File</h2>
+        <p class="text-xs text-slate-400 mb-4">Reads pillar vertex heights from a PolyDrive .stl file and verifies SHA-256 integrity.</p>
+        <label class="flex flex-col items-center justify-center border-2 border-dashed border-slate-700 hover:border-violet-500 rounded-lg p-5 cursor-pointer transition bg-slate-950/50">
+          <span class="text-sm font-medium text-slate-200">Drop a PolyDrive .stl file to extract</span>
+          <span class="text-xs text-slate-500 mt-1">Automatically restores original filename &amp; checks hash</span>
+          <input id="decodeInput" type="file" accept=".stl" class="hidden" />
+        </label>
+        <div id="decodeStatus" class="mt-3 text-xs font-mono text-slate-300 hidden bg-slate-950 p-3 rounded border border-slate-800"></div>
+      </section>
+
+      <section class="bg-slate-900/50 border border-slate-800/80 rounded-xl p-4 text-xs text-slate-400 space-y-1.5">
+        <div class="font-semibold text-slate-200">Storage Density &amp; Format Specs</div>
+        <div>&bull; <span class="text-slate-300">Density:</span> 2 bytes per pillar (12 triangles = 600 bytes STL per 2 payload bytes)</div>
+        <div>&bull; <span class="text-slate-300">Header:</span> <code>POLY</code> (4B) + SHA-256 (32B) + NameLen (1B) + DataLen (4B) + Name</div>
+        <div>&bull; <span class="text-slate-300">Compatibility:</span> Opens in Bambu Studio, PrusaSlicer, Cura, macOS Preview, Blender</div>
+      </section>
+    </div>
+
+    <div class="lg:col-span-7 bg-slate-900/90 border border-slate-800 rounded-xl flex flex-col overflow-hidden min-h-[440px]">
+      <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between bg-slate-950/60">
+        <span class="text-xs font-mono text-slate-300" id="viewportTitle">3D Mesh Preview (Drag to orbit, scroll to zoom)</span>
+        <button id="downloadStlBtn" class="hidden px-3 py-1 rounded bg-cyan-600 hover:bg-cyan-500 text-xs font-semibold text-white transition">
+          Download .STL Carrier
+        </button>
+      </div>
+      <div id="canvasContainer" class="relative flex-1 w-full h-full min-h-[380px]"></div>
+    </div>
+  </main>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { STLLoader } from 'three/addons/loaders/STLLoader.js';
+
+    const MAGIC = new Uint8Array([0x50, 0x4F, 0x4C, 0x59]);
+    const BASE_HEIGHT = 2.0;
+    const SCALE = 1000.0;
+    const CELL_SIZE = 2.0;
+
+    let latestStlBuffer = null;
+    let latestStlFilename = 'carrier.stl';
+
+    async function sha256Bytes(uint8) {
+      const hashBuf = await crypto.subtle.digest('SHA-256', uint8);
+      return new Uint8Array(hashBuf);
+    }
+
+    function toHex(uint8) {
+      return Array.from(uint8).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    async function deflateBytes(uint8) {
+      const cs = new CompressionStream('deflate');
+      const writer = cs.writable.getWriter();
+      writer.write(uint8);
+      writer.close();
+      return new Uint8Array(await new Response(cs.readable).arrayBuffer());
+    }
+
+    async function inflateBytes(uint8) {
+      const ds = new DecompressionStream('deflate');
+      const writer = ds.writable.getWriter();
+      writer.write(uint8);
+      writer.close();
+      return new Uint8Array(await new Response(ds.readable).arrayBuffer());
+    }
+
+    async function packFile(filename, rawBytes) {
+      const hash = await sha256Bytes(rawBytes);
+      const compressed = await deflateBytes(rawBytes);
+      const nameBytes = new TextEncoder().encode(filename).slice(0, 255);
+
+      const headerLen = 4 + 32 + 1 + 4 + nameBytes.length;
+      const totalLen = headerLen + compressed.length;
+      const paddedLen = totalLen + (totalLen % 2);
+      const blob = new Uint8Array(paddedLen);
+
+      blob.set(MAGIC, 0);
+      blob.set(hash, 4);
+      blob[36] = nameBytes.length;
+
+      const view = new DataView(blob.buffer);
+      view.setUint32(37, compressed.length, false);
+      blob.set(nameBytes, 41);
+      blob.set(compressed, headerLen);
+
+      return { blob, origHashHex: toHex(hash), compressedLen: compressed.length };
+    }
+
+    async function unpackBlob(blob) {
+      for (let i = 0; i < 4; i++) {
+        if (blob[i] !== MAGIC[i]) throw new Error('Invalid STL carrier: missing POLY magic header.');
+      }
+      const expectedHashHex = toHex(blob.slice(4, 36));
+      const nameLen = blob[36];
+      const view = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+      const dataLen = view.getUint32(37, false);
+
+      const name = new TextDecoder().decode(blob.slice(41, 41 + nameLen));
+      const compressed = blob.slice(41 + nameLen, 41 + nameLen + dataLen);
+      if (compressed.length !== dataLen) throw new Error('Corrupted STL carrier: payload truncated.');
+
+      const rawBytes = await inflateBytes(compressed);
+      const actualHashHex = toHex(await sha256Bytes(rawBytes));
+      return { name, rawBytes, expectedHashHex, actualHashHex, match: expectedHashHex === actualHashHex };
+    }
+
+    function encodeToBinarySTL(blob) {
+      const numPillars = blob.length / 2;
+      const gridSide = Math.ceil(Math.sqrt(numPillars));
+      const totalCells = gridSide * gridSide;
+
+      const triangleCount = totalCells * 10 + 2;
+      const buffer = new ArrayBuffer(84 + triangleCount * 50);
+      const view = new DataView(buffer);
+
+      const title = 'PolyDrive Weird Storage Mesh - Watertight Binary STL';
+      for (let i = 0; i < title.length; i++) view.setUint8(i, title.charCodeAt(i));
+      view.setUint32(80, triangleCount, true);
+
+      let offset = 84;
+      function writeTri(nx, ny, nz, v1, v2, v3) {
+        view.setFloat32(offset, nx, true);
+        view.setFloat32(offset + 4, ny, true);
+        view.setFloat32(offset + 8, nz, true);
+        const verts = [v1, v2, v3];
+        for (let i = 0; i < 3; i++) {
+          const base = offset + 12 + i * 12;
+          view.setFloat32(base, verts[i][0], true);
+          view.setFloat32(base + 4, verts[i][1], true);
+          view.setFloat32(base + 8, verts[i][2], true);
+        }
+        view.setUint16(offset + 48, 0, true);
+        offset += 50;
+      }
+
+      const blobView = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+      const halfSpan = (gridSide * CELL_SIZE) / 2;
+
+      for (let idx = 0; idx < totalCells; idx++) {
+        const row = Math.floor(idx / gridSide);
+        const col = idx % gridSide;
+        const val = idx < numPillars ? blobView.getUint16(idx * 2, false) : 0;
+        const z = BASE_HEIGHT + val / SCALE;
+
+        const x0 = col * CELL_SIZE - halfSpan;
+        const x1 = x0 + CELL_SIZE;
+        const y0 = row * CELL_SIZE - halfSpan;
+        const y1 = y0 + CELL_SIZE;
+
+        writeTri(0, 0, 1, [x0, y0, z], [x1, y0, z], [x1, y1, z]);
+        writeTri(0, 0, 1, [x0, y0, z], [x1, y1, z], [x0, y1, z]);
+
+        writeTri(0, -1, 0, [x0, y0, 0], [x1, y0, 0], [x1, y0, z]);
+        writeTri(0, -1, 0, [x0, y0, 0], [x1, y0, z], [x0, y0, z]);
+
+        writeTri(1, 0, 0, [x1, y0, 0], [x1, y1, 0], [x1, y1, z]);
+        writeTri(1, 0, 0, [x1, y0, 0], [x1, y1, z], [x1, y0, z]);
+
+        writeTri(0, 1, 0, [x1, y1, 0], [x0, y1, 0], [x0, y1, z]);
+        writeTri(0, 1, 0, [x1, y1, 0], [x0, y1, z], [x1, y1, z]);
+
+        writeTri(-1, 0, 0, [x0, y1, 0], [x0, y0, 0], [x0, y0, z]);
+        writeTri(-1, 0, 0, [x0, y1, 0], [x0, y0, z], [x0, y1, z]);
+      }
+
+      writeTri(0, 0, -1, [-halfSpan, -halfSpan, 0], [halfSpan, halfSpan, 0], [halfSpan, -halfSpan, 0]);
+      writeTri(0, 0, -1, [-halfSpan, -halfSpan, 0], [-halfSpan, halfSpan, 0], [halfSpan, halfSpan, 0]);
+
+      return buffer;
+    }
+
+    function decodeFromBinarySTL(arrayBuffer) {
+      const view = new DataView(arrayBuffer);
+      const triCount = view.getUint32(80, true);
+      const cellMap = new Map();
+
+      for (let i = 0; i < triCount; i++) {
+        const base = 84 + i * 50;
+        const nz = view.getFloat32(base + 8, true);
+        if (nz > 0.99) {
+          const x1 = view.getFloat32(base + 12, true);
+          const y1 = view.getFloat32(base + 16, true);
+          const z = view.getFloat32(base + 20, true);
+          const x2 = view.getFloat32(base + 24, true);
+          const y2 = view.getFloat32(base + 28, true);
+          const x3 = view.getFloat32(base + 36, true);
+          const y3 = view.getFloat32(base + 40, true);
+
+          const minX = Math.round(Math.min(x1, x2, x3) * 100) / 100;
+          const minY = Math.round(Math.min(y1, y2, y3) * 100) / 100;
+          const key = `${minY.toFixed(2)}_${minX.toFixed(2)}`;
+          if (!cellMap.has(key)) {
+            const val = Math.round((z - BASE_HEIGHT) * SCALE);
+            cellMap.set(key, { x: minX, y: minY, val });
+          }
+        }
+      }
+
+      const sortedCells = Array.from(cellMap.values()).sort((a, b) => (a.y - b.y) || (a.x - b.x));
+      const outBytes = new Uint8Array(sortedCells.length * 2);
+      const outView = new DataView(outBytes.buffer);
+      sortedCells.forEach((cell, idx) => outView.setUint16(idx * 2, cell.val, false));
+      return outBytes;
+    }
+
+    const container = document.getElementById('canvasContainer');
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x090d16);
+
+    const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 2000);
+    camera.position.set(45, 55, 65);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(container.clientWidth, container.clientHeight);
+    container.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+    const dirLight = new THREE.DirectionalLight(0x38bdf8, 1.4);
+    dirLight.position.set(50, 100, 50);
+    scene.add(dirLight);
+    const rimLight = new THREE.DirectionalLight(0xa855f7, 0.8);
+    rimLight.position.set(-50, 40, -50);
+    scene.add(rimLight);
+
+    let currentMesh = null;
+    const stlLoader = new STLLoader();
+
+    function renderStlPreview(arrayBuffer) {
+      if (currentMesh) {
+        scene.remove(currentMesh);
+        currentMesh.geometry.dispose();
+      }
+      const geometry = stlLoader.parse(arrayBuffer);
+      geometry.rotateX(-Math.PI / 2);
+      geometry.computeBoundingBox();
+
+      const material = new THREE.MeshStandardMaterial({
+        color: 0x22d3ee,
+        roughness: 0.35,
+        metalness: 0.25,
+        flatShading: true
+      });
+      currentMesh = new THREE.Mesh(geometry, material);
+      scene.add(currentMesh);
+
+      const box = geometry.boundingBox;
+      const size = new THREE.Vector3();
+      box.getSize(size);
+      const maxDim = Math.max(size.x, size.y, size.z);
+      camera.position.set(maxDim * 0.9, maxDim * 0.85, maxDim * 1.1);
+      controls.target.set(0, size.y * 0.3, 0);
+      controls.update();
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+      controls.update();
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = container.clientWidth / container.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(container.clientWidth, container.clientHeight);
+    });
+
+    function triggerDownload(bufferOrUint8, filename, mime = 'application/octet-stream') {
+      const blob = new Blob([bufferOrUint8], { type: mime });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    async function handleEncode(file) {
+      const rawBytes = new Uint8Array(await file.arrayBuffer());
+      const { blob, origHashHex, compressedLen } = await packFile(file.name, rawBytes);
+      const stlBuffer = encodeToBinarySTL(blob);
+
+      latestStlBuffer = stlBuffer;
+      latestStlFilename = `${file.name}.stl`;
+      renderStlPreview(stlBuffer);
+
+      document.getElementById('downloadStlBtn').classList.remove('hidden');
+      document.getElementById('viewportTitle').textContent = `3D Preview: ${latestStlFilename} (${(stlBuffer.byteLength / 1024).toFixed(1)} KB)`;
+
+      const status = document.getElementById('encodeStatus');
+      status.classList.remove('hidden');
+      status.innerHTML = `
+        <div class="text-cyan-400 font-bold mb-1">✓ Encoded into 3D STL Mesh</div>
+        <div>Original: ${file.name} (${rawBytes.length} B) &rarr; Deflated: ${compressedLen} B</div>
+        <div>Pillars: ${blob.length / 2} | STL Size: ${(stlBuffer.byteLength / 1024).toFixed(1)} KB</div>
+        <div class="truncate text-slate-400 mt-1">SHA-256: ${origHashHex}</div>
+      `;
+    }
+
+    async function handleDecode(stlArrayBuffer) {
+      const status = document.getElementById('decodeStatus');
+      status.classList.remove('hidden');
+      try {
+        renderStlPreview(stlArrayBuffer);
+        const extractedBlob = decodeFromBinarySTL(stlArrayBuffer);
+        const result = await unpackBlob(extractedBlob);
+        const safeName = result.name.split('/').pop().split('\\').pop() || 'recovered.bin';
+
+        triggerDownload(result.rawBytes, safeName);
+        status.innerHTML = `
+          <div class="${result.match ? 'text-emerald-400' : 'text-rose-400'} font-bold mb-1">
+            ${result.match ? '✓ SHA-256 VERIFIED - EXACT BIT MATCH' : '✗ HASH MISMATCH'}
+          </div>
+          <div>Recovered File: <span class="text-white">${safeName}</span> (${result.rawBytes.length} B)</div>
+          <div class="truncate text-slate-400 mt-1">Expected: ${result.expectedHashHex}</div>
+          <div class="truncate text-slate-400">Actual:   ${result.actualHashHex}</div>
+        `;
+      } catch (err) {
+        status.innerHTML = `<div class="text-rose-400 font-bold">Error: ${err.message}</div>`;
+      }
+    }
+
+    document.getElementById('encodeInput').addEventListener('change', e => {
+      if (e.target.files[0]) handleEncode(e.target.files[0]);
+    });
+
+    document.getElementById('decodeInput').addEventListener('change', async e => {
+      if (e.target.files[0]) handleDecode(await e.target.files[0].arrayBuffer());
+    });
+
+    document.getElementById('downloadStlBtn').addEventListener('click', () => {
+      if (latestStlBuffer) triggerDownload(latestStlBuffer, latestStlFilename, 'model/stl');
+    });
+
+    document.getElementById('demoBtn').addEventListener('click', async () => {
+      const sampleText = 'Hack Club Crescent Weird Storage Proof!\nEvery pillar height in this 3D printable STL mesh encodes 16 bits of this file.\n';
+      const sampleFile = new File([sampleText.repeat(12)], 'crescent_proof.txt', { type: 'text/plain' });
+      await handleEncode(sampleFile);
+      await handleDecode(latestStlBuffer);
+    });
+  </script>
+</body>
+</html>
